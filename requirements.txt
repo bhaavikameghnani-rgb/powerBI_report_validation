@@ -1,0 +1,15 @@
+streamlit
+pandas
+numpy
+pillow
+openpyxl
+pymupdf
+pbixray
+pytesseract
+tableauserverclient
+
+# For the KPI-tile comparison, you need ONE of:
+#   1) pytesseract above + the separate Tesseract OCR engine installed
+#      (https://github.com/UB-Mannheim/tesseract/wiki), OR
+#   2) pip install -r requirements-ocr-easyocr.txt  (pip-only, no installer,
+#      but downloads ~1GB of model weights on first run)
