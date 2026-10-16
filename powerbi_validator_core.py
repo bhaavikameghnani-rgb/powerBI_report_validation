@@ -259,29 +259,111 @@ def parse_workbook(path):
         "notes": "; ".join(n for n in [model_meta["note"], page_note] if n),
     }
 
+def _values_equal(a, b):
+    """
+    Compare metadata values without treating harmless numeric formatting
+    differences such as 3 vs 3.0 as mismatches.
 
+    Examples:
+        3 == 3.0
+        "3" == "3.0"
+        16 == "16.0"
+
+    Non-numeric strings are still compared as strings.
+    """
+    # Both missing / NaN
+    if pd.isna(a) and pd.isna(b):
+        return True
+
+    # One missing, one populated
+    if pd.isna(a) or pd.isna(b):
+        return False
+
+    # First try numeric comparison, including numpy numeric types
+    try:
+        a_num = pd.to_numeric(a)
+        b_num = pd.to_numeric(b)
+
+        if not pd.isna(a_num) and not pd.isna(b_num):
+            return float(a_num) == float(b_num)
+    except (TypeError, ValueError):
+        pass
+
+    # Fall back to normal string comparison
+    return str(a).strip() == str(b).strip()
+
+
+def _display_value(value):
+    """
+    Format comparison values cleanly for the Streamlit table and Excel
+    report. Numeric values that are mathematically whole are displayed
+    without an unnecessary .0.
+    """
+    if pd.isna(value):
+        return ""
+
+    try:
+        numeric = pd.to_numeric(value)
+
+        if not pd.isna(numeric):
+            numeric = float(numeric)
+
+            if numeric.is_integer():
+                return str(int(numeric))
+
+            return str(numeric)
+    except (TypeError, ValueError):
+        pass
+
+    return str(value)
 # ── Metadata comparison ──────────────────────────────────────
 def _diff_on_key(src_df, dst_df, key_col, compare_cols, label):
     if src_df.empty and dst_df.empty:
         return pd.DataFrame()
+
     # Safety net: duplicate keys on either side would multiply rows (N x M)
     # instead of comparing 1:1 — collapse to one row per key before merging.
     src_df = src_df.drop_duplicates(subset=[key_col], keep="first")
     dst_df = dst_df.drop_duplicates(subset=[key_col], keep="first")
-    merged = pd.merge(src_df, dst_df, on=key_col, how="outer", suffixes=("_SRC", "_DST"))
+
+    merged = pd.merge(
+        src_df,
+        dst_df,
+        on=key_col,
+        how="outer",
+        suffixes=("_SRC", "_DST"),
+    )
+
     rows = []
+
     for _, r in merged.iterrows():
         for col in compare_cols:
-            s = r.get(f"{col}_SRC", "")
-            d = r.get(f"{col}_DST", "")
-            s = "" if pd.isna(s) else str(s)
-            d = "" if pd.isna(d) else str(d)
-            if s == d:
+            s_raw = r.get(f"{col}_SRC", "")
+            d_raw = r.get(f"{col}_DST", "")
+
+            s_missing = pd.isna(s_raw) or str(s_raw).strip() == ""
+            d_missing = pd.isna(d_raw) or str(d_raw).strip() == ""
+
+            # If both values are equivalent, there is no difference.
+            # This correctly treats 3 and 3.0 as equal.
+            if _values_equal(s_raw, d_raw):
                 continue
-            status = ("Missing in Destination" if d == "" else
-                      "Extra in Destination" if s == "" else "Mismatch")
-            rows.append({label: r[key_col], "Field": col,
-                         "Source Value": s, "Target Value": d, "Status": status})
+
+            if d_missing:
+                status = "Missing in Destination"
+            elif s_missing:
+                status = "Extra in Destination"
+            else:
+                status = "Mismatch"
+
+            rows.append({
+                label: r[key_col],
+                "Field": col,
+                "Source Value": _display_value(s_raw),
+                "Target Value": _display_value(d_raw),
+                "Status": status,
+            })
+
     return pd.DataFrame(rows)
 
 
