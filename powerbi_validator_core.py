@@ -241,10 +241,479 @@ def parse_report_pages(path):
         note = f"Could not parse report pages: {e}"
     return rows, note
 
+# ── PBIP project parsing ─────────────────────────────────────
 
+def _find_first_file(root, filename):
+    for current_root, _, files in os.walk(root):
+        for name in files:
+            if name.lower() == filename.lower():
+                return os.path.join(current_root, name)
+    return None
+
+
+def _find_files(root, extensions):
+    matches = []
+
+    for current_root, _, files in os.walk(root):
+        for name in files:
+            if any(name.lower().endswith(ext) for ext in extensions):
+                matches.append(os.path.join(current_root, name))
+
+    return matches
+
+
+def _parse_tmdl_files(project_root):
+    """
+    Best-effort parser for PBIP semantic-model TMDL files.
+
+    Extracts:
+      - tables
+      - columns
+      - measures
+      - calculated columns
+      - calculated tables
+      - Power Query expressions
+      - relationships
+      - RLS roles
+
+    TMDL is indentation-sensitive, so this parser intentionally focuses
+    on the common metadata declarations rather than trying to implement
+    the complete TMDL language.
+    """
+
+    table_rows = []
+    column_rows = []
+    measure_rows = []
+    calc_column_rows = []
+    calc_table_rows = []
+    relationship_rows = []
+    power_query_rows = []
+    rls_rows = []
+
+    tmdl_files = _find_files(project_root, [".tmdl"])
+
+    current_table = None
+    current_column = None
+    current_measure = None
+    current_partition = None
+    current_role = None
+
+    expression_lines = []
+    expression_target = None
+
+    def flush_expression():
+        nonlocal expression_lines, expression_target
+
+        if expression_target is None:
+            expression_lines = []
+            return
+
+        expression = "\n".join(expression_lines).strip()
+
+        if expression:
+            expression_target["Expression"] = expression
+
+        expression_lines = []
+        expression_target = None
+
+    for path in tmdl_files:
+        try:
+            with open(path, "r", encoding="utf-8-sig") as f:
+                lines = f.readlines()
+        except UnicodeDecodeError:
+            with open(path, "r", encoding="utf-8") as f:
+                lines = f.readlines()
+        except Exception:
+            continue
+
+        for raw_line in lines:
+            line = raw_line.rstrip("\r\n")
+
+            if not line.strip():
+                continue
+
+            stripped = line.strip()
+            indent = len(line) - len(line.lstrip())
+
+            # New table
+            m = re.match(r"^table\s+(.+?)\s*$", stripped)
+            if m and indent <= 4:
+                flush_expression()
+
+                table_name = m.group(1).strip().strip("'")
+
+                current_table = table_name
+                current_column = None
+                current_measure = None
+                current_partition = None
+                current_role = None
+
+                table_rows.append({
+                    "Table Name": table_name,
+                    "Column Count": 0,
+                })
+
+                continue
+
+            # New column
+            m = re.match(r"^column\s+(.+?)\s*$", stripped)
+            if m and current_table is not None:
+                flush_expression()
+
+                column_name = m.group(1).strip().strip("'")
+
+                current_column = {
+                    "Column Name": column_name,
+                    "Table Name": current_table,
+                    "Expression": "",
+                }
+
+                column_rows.append({
+                    "Table.Column":
+                        f"{current_table}.{column_name}",
+                    "Datatype": "",
+                })
+
+                current_measure = None
+                current_partition = None
+                continue
+
+            # New measure
+            m = re.match(
+                r"^measure\s+(.+?)(?:\s*=\s*(.*))?$",
+                stripped,
+            )
+
+            if m and current_table is not None:
+                flush_expression()
+
+                measure_name = m.group(1).strip().strip("'")
+                measure_expression = (m.group(2) or "").strip()
+
+                current_measure = {
+                    "Measure Name": measure_name,
+                    "Table Name": current_table,
+                    "Expression": measure_expression,
+                    "Display Folder": "",
+                }
+
+                measure_rows.append(current_measure)
+
+                current_column = None
+                current_partition = None
+                continue
+
+            # New partition / Power Query source
+            m = re.match(r"^partition\s+(.+?)\s*=\s*(.*)$", stripped)
+
+            if m and current_table is not None:
+                flush_expression()
+
+                current_partition = {
+                    "Table Name": current_table,
+                    "Expression": m.group(2).strip(),
+                }
+
+                power_query_rows.append(current_partition)
+
+                current_column = None
+                current_measure = None
+                continue
+
+            # Relationship
+            m = re.match(r"^relationship\s+(.+?)\s*$", stripped)
+
+            if m:
+                flush_expression()
+
+                relationship_rows.append({
+                    "Relationship": m.group(1).strip().strip("'"),
+                    "Cardinality": "",
+                    "Is Active": "",
+                    "Cross Filter": "",
+                })
+
+                continue
+
+            # Role / RLS
+            m = re.match(r"^role\s+(.+?)\s*$", stripped)
+
+            if m:
+                flush_expression()
+
+                current_role = {
+                    "Role Name": m.group(1).strip().strip("'"),
+                    "Table Name": "",
+                    "Filter Expression": "",
+                }
+
+                rls_rows.append(current_role)
+                continue
+
+            # Datatype
+            if current_column is not None:
+                m = re.match(r"^dataType:\s*(.+)$", stripped)
+
+                if m:
+                    datatype = m.group(1).strip()
+
+                    for row in reversed(column_rows):
+                        if row["Table.Column"] == (
+                            f"{current_table}.{current_column['Column Name']}"
+                        ):
+                            row["Datatype"] = datatype
+                            break
+
+                    continue
+
+            # DAX / M expression continuation
+            if stripped.startswith("expression ="):
+                flush_expression()
+
+                expression_target = (
+                    current_measure
+                    or current_column
+                    or current_partition
+                    or current_role
+                )
+
+                expression_lines = [
+                    stripped.split("=", 1)[1].strip()
+                ]
+
+                continue
+
+            if expression_target is not None:
+                # Indented continuation of an expression
+                if indent > 4:
+                    expression_lines.append(stripped)
+                    continue
+
+        flush_expression()
+
+    # Update table column counts
+    for table_row in table_rows:
+        table_name = table_row["Table Name"]
+
+        count = sum(
+            1
+            for row in column_rows
+            if row["Table.Column"].startswith(table_name + ".")
+        )
+
+        table_row["Column Count"] = count
+
+    return {
+        "tables": pd.DataFrame(
+            table_rows,
+            columns=["Table Name", "Column Count"],
+        ),
+        "columns": pd.DataFrame(
+            column_rows,
+            columns=["Table.Column", "Datatype"],
+        ),
+        "measures": pd.DataFrame(
+            measure_rows,
+            columns=[
+                "Measure Name",
+                "Table Name",
+                "Expression",
+                "Display Folder",
+            ],
+        ),
+        "calc_columns": pd.DataFrame(
+            calc_column_rows,
+            columns=[
+                "Column Name",
+                "Table Name",
+                "Expression",
+            ],
+        ),
+        "calc_tables": pd.DataFrame(
+            calc_table_rows,
+            columns=["Table Name", "Expression"],
+        ),
+        "relationships": pd.DataFrame(
+            relationship_rows,
+            columns=[
+                "Relationship",
+                "Cardinality",
+                "Is Active",
+                "Cross Filter",
+            ],
+        ),
+        "power_query": pd.DataFrame(
+            power_query_rows,
+            columns=["Table Name", "Expression"],
+        ),
+        "parameters": pd.DataFrame(
+            columns=["Parameter Name", "Expression"],
+        ),
+        "rls": pd.DataFrame(
+            rls_rows,
+            columns=[
+                "Role Name",
+                "Table Name",
+                "Filter Expression",
+            ],
+        ),
+    }
+def _parse_pbip_report(project_root):
+    """
+    Extract report pages and visual types from PBIR project files.
+    Supports the newer PBIR folder structure and PBIR-Legacy report.json.
+    """
+
+    rows = []
+
+    # ── PBIR format ──────────────────────────────────────────
+
+    page_json_files = _find_files(project_root, ["page.json"])
+
+    for page_path in page_json_files:
+        try:
+            with open(page_path, "r", encoding="utf-8-sig") as f:
+                data = json.load(f)
+        except Exception:
+            continue
+
+        page_name = (
+            data.get("displayName")
+            or data.get("name")
+            or os.path.basename(os.path.dirname(page_path))
+        )
+
+        page_dir = os.path.dirname(page_path)
+
+        visual_types = []
+
+        for root, _, files in os.walk(page_dir):
+            for filename in files:
+                if filename.lower() != "visual.json":
+                    continue
+
+                visual_path = os.path.join(root, filename)
+
+                try:
+                    with open(
+                        visual_path,
+                        "r",
+                        encoding="utf-8-sig",
+                    ) as f:
+                        visual_data = json.load(f)
+
+                    visual = visual_data.get("visual", visual_data)
+
+                    visual_type = (
+                        visual.get("visualType")
+                        or visual.get("singleVisual", {}).get("visualType")
+                        or "unknown"
+                    )
+
+                    visual_types.append(visual_type)
+
+                except Exception:
+                    visual_types.append("unknown")
+
+        rows.append({
+            "Page Name": page_name,
+            "Visual Count": len(visual_types),
+            "Visual Types": ", ".join(sorted(set(visual_types))),
+        })
+
+    if rows:
+        return rows, ""
+
+    # ── PBIR-Legacy ──────────────────────────────────────────
+
+    report_json = _find_first_file(project_root, "report.json")
+
+    if report_json:
+        try:
+            with open(
+                report_json,
+                "r",
+                encoding="utf-8-sig",
+            ) as f:
+                data = json.load(f)
+
+            for section in data.get("sections", []):
+                visual_types = []
+
+                for visual in section.get("visualContainers", []):
+                    try:
+                        config = json.loads(
+                            visual.get("config", "{}")
+                        )
+
+                        visual_type = (
+                            config
+                            .get("singleVisual", {})
+                            .get("visualType", "unknown")
+                        )
+
+                    except Exception:
+                        visual_type = "unknown"
+
+                    visual_types.append(visual_type)
+
+                rows.append({
+                    "Page Name": (
+                        section.get("displayName")
+                        or section.get("name", "")
+                    ),
+                    "Visual Count": len(
+                        section.get("visualContainers", [])
+                    ),
+                    "Visual Types": ", ".join(
+                        sorted(set(visual_types))
+                    ),
+                })
+
+            return rows, ""
+
+        except Exception as e:
+            return rows, f"Could not parse report.json: {e}"
+
+    return rows, (
+        "No PBIR page definitions or report.json "
+        "were found in the PBIP project."
+    )
 def parse_workbook(path):
+    """
+    Parse either:
+      - a .pbix file
+      - a PBIP project directory
+
+    Both return the same metadata structure so the existing
+    compare_metadata() function can be reused.
+    """
+
+    # ── PBIP project ──────────────────────────────────────────
+    if os.path.isdir(path):
+        model_meta = _parse_tmdl_files(path)
+        page_rows, page_note = _parse_pbip_report(path)
+
+        return {
+            "tables": model_meta["tables"].fillna(""),
+            "columns": model_meta["columns"].fillna(""),
+            "measures": model_meta["measures"].fillna(""),
+            "calc_columns": model_meta["calc_columns"].fillna(""),
+            "calc_tables": model_meta["calc_tables"].fillna(""),
+            "relationships": model_meta["relationships"].fillna(""),
+            "power_query": model_meta["power_query"].fillna(""),
+            "parameters": model_meta["parameters"].fillna(""),
+            "rls": model_meta["rls"].fillna(""),
+            "pages": pd.DataFrame(page_rows).fillna(""),
+            "notes": "; ".join(
+                n for n in [page_note] if n
+            ),
+        }
+
+    # ── PBIX file ─────────────────────────────────────────────
     model_meta = parse_model_metadata(path)
     page_rows, page_note = parse_report_pages(path)
+
     return {
         "tables": model_meta["tables"],
         "columns": model_meta["columns"],
@@ -256,7 +725,10 @@ def parse_workbook(path):
         "parameters": model_meta["parameters"],
         "rls": model_meta["rls"],
         "pages": pd.DataFrame(page_rows).fillna(""),
-        "notes": "; ".join(n for n in [model_meta["note"], page_note] if n),
+        "notes": "; ".join(
+            n for n in [model_meta["note"], page_note]
+            if n
+        ),
     }
 
 def _values_equal(a, b):
